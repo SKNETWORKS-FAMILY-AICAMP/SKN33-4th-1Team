@@ -1,0 +1,73 @@
+"""Django API에서 기존 RAG 실행 계층을 안전하게 호출한다."""
+
+from __future__ import annotations
+
+import os
+import sys
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+from .media_catalog import media_for_citations
+
+
+class RagUnavailableError(RuntimeError):
+    """필수 설정이나 RAG 의존성이 준비되지 않은 경우."""
+
+
+def _repository_root() -> Path:
+    configured = os.getenv("RAG_PROJECT_ROOT", "").strip()
+    if configured:
+        return Path(configured)
+    return Path(__file__).resolve().parents[2]
+
+
+@lru_cache(maxsize=1)
+def _retrieval_module():
+    root = _repository_root()
+    for directory in (root / "app", root / "src"):
+        if not directory.is_dir():
+            raise RagUnavailableError(f"RAG source directory is missing: {directory}")
+        path = str(directory)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+    try:
+        import rag_client
+        import retrieval
+    except ImportError as exc:
+        raise RagUnavailableError("RAG dependencies are not installed.") from exc
+
+    return rag_client, retrieval
+
+
+def answer(
+    question: str,
+    *,
+    audience_level: str,
+    interaction_id: str | None = None,
+    clarification_context: dict[str, Any] | None = None,
+    selected_source_chunk_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    rag_client, retrieval = _retrieval_module()
+    missing = rag_client.missing_env()
+    if missing:
+        raise RagUnavailableError("RAG environment is not configured: " + ", ".join(missing))
+
+    try:
+        execution = retrieval.answer(
+            question,
+            audience_level=audience_level,
+            interaction_id=interaction_id,
+            clarification_context=clarification_context,
+            selected_source_chunk_ids=selected_source_chunk_ids,
+        )
+    except Exception as exc:  # The API view keeps infrastructure detail out of the browser response.
+        raise RagUnavailableError("RAG request failed.") from exc
+
+    response = execution.get("response") if isinstance(execution, dict) else None
+    if not isinstance(response, dict):
+        raise RagUnavailableError("RAG returned an invalid response.")
+    result = {**response, "demo": False}
+    result["media"] = media_for_citations(result.get("citations") or [])
+    return result
